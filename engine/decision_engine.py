@@ -51,113 +51,180 @@ def evaluate_experiment(
     uplift_context: str | None = None,
     planned_duration_days: int | None = None,
 ) -> Decision:
-    """
-    The single entry point. Expects df with columns matching the
-    simulator's schema: group, converted, pre_experiment_activity,
-    day_assigned (day_assigned only needed if you want the sequential
-    check; if absent, that gate is skipped with a note).
 
-    min_practical_effect: the smallest lift that's actually WORTH shipping
-    for, even if statistically significant (a statistically significant
-    but practically tiny effect might not be worth the engineering cost
-    of shipping - this lets the decision engine account for that).
-
-    uplift_context: optional plain-text note from the CATE model (Step 7),
-    e.g. "44% of users show positive predicted uplift" - attached as
-    advisory context, not used to gate the decision.
-
-    planned_duration_days: the experiment's PLANNED total duration (e.g.
-    from the power analysis in Step 2). Without this, a genuinely null
-    effect would report NEEDS_MORE_DATA forever, since mSPRT correctly
-    never crosses the threshold when there's truly nothing there. Passing
-    this lets the engine correctly conclude "no effect found, HOLD" once
-    the planned duration is reached without significance - a business
-    cannot wait on an inconclusive test indefinitely.
-    """
     reasoning = []
 
-    # --- Gate 1: SRM check (hard gate) ---
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between 0 and 1.")
+
+    if min_practical_effect < 0:
+        raise ValueError("min_practical_effect cannot be negative.")
+
+    if planned_duration_days is not None and planned_duration_days <= 0:
+        raise ValueError("planned_duration_days must be positive.")
+
+    # --- Gate 1: SRM check ---
     srm_result = check_srm(df)
+
     if srm_result.srm_detected:
         reasoning.append(
-            f"SRM DETECTED: observed split {srm_result.observed_split:.2%} vs expected 50% "
-            f"(p={srm_result.p_value}). Every result below is potentially biased until this "
-            f"is fixed - check platform/segment-level diagnostics to localize the bug."
+            f"SRM DETECTED: observed split "
+            f"{srm_result.observed_split:.2%} vs expected 50% "
+            f"(p={srm_result.p_value}). Results are potentially biased."
         )
+
         return Decision(
             verdict="INVALID_SRM",
             reasoning=reasoning,
             srm_check_passed=False,
         )
-    reasoning.append("SRM check passed - traffic split matches expected ratio.")
 
-    # --- Gate 2: Sequential test status (is it safe to stop / conclude yet?) ---
+    reasoning.append("SRM check passed - traffic allocation is acceptable.")
+
+    # --- Gate 2: Sequential statistical evidence ---
     sequential_safe = False
     reached_planned_duration = False
+    sequential_effect = None
+    decision_p_value = None
+
     if "day_assigned" in df.columns:
+
         seq_results = run_sequential_test(df, alpha=alpha)
-        final_day_result = seq_results[-1]
-        sequential_safe = final_day_result.reject_null
+
+        if not seq_results:
+            raise ValueError("Sequential testing returned no results.")
+
+        final_result = seq_results[-1]
+
+        # Preserve a rejection reached at ANY earlier monitoring look.
+        crossing_results = [
+            result for result in seq_results
+            if result.reject_null
+        ]
+
+        sequential_safe = bool(crossing_results)
+
+        # The adjusted p-value is the running minimum across looks.
+        decision_p_value = final_result.anytime_valid_p_value
+
+        # Use the final cumulative observed effect for direction.
+        sequential_effect = final_result.observed_lift
+
         reached_planned_duration = (
-            planned_duration_days is not None and final_day_result.day >= planned_duration_days - 1
+            planned_duration_days is not None
+            and final_result.day >= planned_duration_days - 1
         )
+
         if sequential_safe:
+            first_crossing = crossing_results[0]
+
             reasoning.append(
-                f"Sequential test (mSPRT) has crossed the significance threshold as of day "
-                f"{final_day_result.day} - safe to conclude even if this was checked daily."
+                f"Fisher-based alpha-spending test crossed its "
+                f"significance boundary on day {first_crossing.day}. "
+                f"Adjusted sequential p-value: {decision_p_value:.6f}."
             )
+
         elif reached_planned_duration:
             reasoning.append(
-                f"Sequential test has NOT crossed the threshold, but the experiment has reached "
-                f"its planned duration ({planned_duration_days} days) - concluding as inconclusive "
-                f"rather than waiting indefinitely."
+                f"No sequential significance was detected, but the "
+                f"planned duration of {planned_duration_days} days "
+                f"has been reached. Treating the result as inconclusive."
             )
+
         else:
             reasoning.append(
-                f"Sequential test (mSPRT) has NOT yet crossed the significance threshold "
-                f"(day {final_day_result.day}). Continuing to collect data is still safe; "
-                f"stopping now and forcing a verdict would risk a false conclusion."
+                f"No sequential significance detected by day "
+                f"{final_result.day}. Continue collecting data."
             )
-    else:
-        reasoning.append("No day-level data provided - sequential check skipped.")
 
-    # --- Effect estimate: prefer CUPED-adjusted over raw ---
+    else:
+        reasoning.append(
+            "No day-level data provided - sequential testing skipped. "
+            "Using the ordinary CUPED analysis instead."
+        )
+
+    # --- Effect estimation using CUPED ---
     cuped_result = compare_raw_vs_cuped(df, alpha=alpha)
+
     effect = cuped_result.cuped_absolute_lift
-    p_value = cuped_result.p_value_cuped
+
     reasoning.append(
-        f"CUPED-adjusted effect estimate: {effect:.2%} (p={p_value}), "
-        f"{cuped_result.variance_reduction_pct:.1f}% lower variance than the raw estimate."
+        f"CUPED-adjusted effect estimate: {effect:.2%}. "
+        f"Reported variance reduction: "
+        f"{cuped_result.variance_reduction_pct:.1f}%."
     )
 
-    # --- Attach CATE/uplift context as advisory, not a gate ---
+    # --- Advisory uplift context ---
     if uplift_context:
-        reasoning.append(f"Uplift model context: {uplift_context}")
-
-    # --- Final verdict logic ---
-    if not sequential_safe and not reached_planned_duration and "day_assigned" in df.columns:
-        verdict = "NEEDS_MORE_DATA"
-    elif p_value >= alpha:
-        verdict = "HOLD"
-        reasoning.append("Effect is not statistically significant - insufficient evidence to ship or kill.")
-    elif effect < 0:
-        verdict = "KILL"
-        reasoning.append(f"Effect is significant and NEGATIVE ({effect:.2%}) - recommend killing this feature.")
-    elif abs(effect) < min_practical_effect:
-        verdict = "HOLD"
         reasoning.append(
-            f"Effect is statistically significant but below the minimum practical threshold "
-            f"({min_practical_effect:.2%}) - likely not worth the engineering cost to ship."
+            f"Uplift model context (advisory): {uplift_context}"
         )
+
+    # --- Final decision ---
+    if "day_assigned" in df.columns:
+
+        if not sequential_safe and not reached_planned_duration:
+            verdict = "NEEDS_MORE_DATA"
+
+        elif not sequential_safe:
+            verdict = "HOLD"
+            reasoning.append(
+                "The experiment reached its planned duration without "
+                "sequential statistical significance."
+            )
+
+        elif sequential_effect < 0:
+            verdict = "KILL"
+            reasoning.append(
+                "The sequential test detected a significant negative effect."
+            )
+
+        elif abs(effect) < min_practical_effect:
+            verdict = "HOLD"
+            reasoning.append(
+                "The estimated effect is below the minimum practical "
+                "effect threshold."
+            )
+
+        else:
+            verdict = "SHIP"
+            reasoning.append(
+                "The sequential test detected a significant positive effect."
+            )
+
     else:
-        verdict = "SHIP"
-        reasoning.append(f"Effect is significant and positive ({effect:.2%}) - recommend shipping.")
+        # Fixed-horizon fallback when day-level data is unavailable.
+        decision_p_value = cuped_result.p_value_cuped
+
+        if decision_p_value >= alpha:
+            verdict = "HOLD"
+            reasoning.append(
+                "The CUPED-adjusted result is not statistically significant."
+            )
+
+        elif effect < 0:
+            verdict = "KILL"
+            reasoning.append(
+                "The CUPED-adjusted effect is significantly negative."
+            )
+
+        elif abs(effect) < min_practical_effect:
+            verdict = "HOLD"
+            reasoning.append(
+                "The effect is below the minimum practical threshold."
+            )
+
+        else:
+            verdict = "SHIP"
+            reasoning.append(
+                "The CUPED-adjusted effect is significantly positive."
+            )
 
     return Decision(
         verdict=verdict,
         reasoning=reasoning,
         effect_estimate=effect,
-        p_value=p_value,
+        p_value=decision_p_value,
         srm_check_passed=True,
         sequential_safe_to_stop=sequential_safe,
     )

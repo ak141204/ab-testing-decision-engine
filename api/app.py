@@ -17,10 +17,11 @@ Run locally with:
 Then visit http://127.0.0.1:8000/docs for FastAPI's auto-generated,
 interactive API documentation (this alone is worth demoing live).
 """
-
+import logging
 import sys
 import os
 
+logger = logging.getLogger(__name__)
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "data"))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "engine"))
@@ -47,24 +48,44 @@ app = FastAPI(
 # Allow the local frontend dashboard (opened as a file, or served from any
 # origin during development) to call this API. In a real production
 # deployment this would be locked down to a specific origin, not "*".
+allowed_origins = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:5500,http://127.0.0.1:5500"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[origin.strip() for origin in allowed_origins],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
+
 class ExperimentRequest(BaseModel):
-    n_users: int = Field(50_000, description="Total users across both arms")
-    true_control_rate: float = Field(0.10, description="Baseline conversion rate")
-    true_lift: float = Field(0.02, description="Absolute lift in conversion rate for treatment")
-    srm_bias: float = Field(0.0, description="Global traffic split bias to inject (0 = none)")
-    biased_platform: Optional[str] = Field(None, description="Platform to inject segment-specific SRM into")
-    segment_bias_strength: float = Field(0.0, description="Strength of the segment-specific SRM bias")
-    n_days: int = Field(14, description="Experiment duration in days")
-    alpha: float = Field(0.05, description="Significance level")
-    min_practical_effect: float = Field(0.0, description="Smallest lift worth shipping for")
+    n_users: int = Field(50_000, ge=2, description="Total users across both arms")
+    true_control_rate: float = Field(
+        0.10, gt=0, lt=1, description="Baseline conversion rate"
+    )
+    true_lift: float = Field(
+        0.02, description="Absolute lift in conversion rate for treatment"
+    )
+    srm_bias: float = Field(
+        0.0, description="Global traffic split bias to inject"
+    )
+    biased_platform: Optional[str] = Field(
+        None, description="Platform to inject segment-specific SRM into"
+    )
+    segment_bias_strength: float = Field(
+        0.0, description="Strength of the segment-specific SRM bias"
+    )
+    n_days: int = Field(14, ge=1, description="Experiment duration in days")
+    alpha: float = Field(
+        0.05, gt=0, lt=1, description="Significance level"
+    )
+    min_practical_effect: float = Field(
+        0.0, ge=0, description="Smallest lift worth shipping for"
+    )
     seed: Optional[int] = Field(None, description="Random seed for reproducibility")
 
 
@@ -122,8 +143,12 @@ def simulate_and_analyze(request: ExperimentRequest):
             srm_check_passed=decision.srm_check_passed,
             sequential_safe_to_stop=decision.sequential_safe_to_stop,
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        except Exception:
+            logger.exception("Unexpected error during experiment analysis")
+            raise HTTPException(
+                status_code=500,
+                detail="An internal error occurred while analyzing the experiment."
+            )
 
 
 if __name__ == "__main__":
