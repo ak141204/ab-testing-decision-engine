@@ -39,6 +39,29 @@ class SimulationConfig:
     segment_bias_strength: float = 0.0  # extra split skew applied only to biased_platform
     seed: int | None = None
 
+def _calibrate_intercept(features, target_rate, beta):
+    """
+    Find a logistic-regression intercept such that the mean
+    predicted conversion probability matches target_rate.
+    """
+
+    if not 0 < target_rate < 1:
+        raise ValueError("Target conversion rate must be between 0 and 1.")
+
+    low, high = -30.0, 30.0
+
+    for _ in range(100):
+        midpoint = (low + high) / 2
+
+        logits = midpoint + beta * features
+        probabilities = 1 / (1 + np.exp(-logits))
+
+        if probabilities.mean() < target_rate:
+            low = midpoint
+        else:
+            high = midpoint
+
+    return (low + high) / 2
 
 def simulate_experiment(config: SimulationConfig) -> pd.DataFrame:
     """
@@ -83,24 +106,62 @@ def simulate_experiment(config: SimulationConfig) -> pd.DataFrame:
     pre_activity = np.clip(pre_activity, 0, None)
 
     # --- Outcome generation ---
-    # Base propensity to convert is a function of the covariate (so the
-    # covariate is genuinely predictive) plus the treatment effect.
-    base_logit = -2.0 + config.covariate_correlation * (pre_activity - 50) / 15
-    treatment_bump = np.where(
-        group == "treatment",
-        np.log(
-            (config.true_control_rate + config.true_lift) / (1 - config.true_control_rate - config.true_lift)
-        ) - np.log(config.true_control_rate / (1 - config.true_control_rate)),
-        0.0,
-    )
-    logit = base_logit + treatment_bump
-    prob_convert = 1 / (1 + np.exp(-logit))
-    # Rescale so control group's average matches true_control_rate exactly
-    control_mask = group == "control"
-    scale_factor = config.true_control_rate / prob_convert[control_mask].mean()
-    prob_convert = np.clip(prob_convert * scale_factor, 0, 1)
+        # --- Outcome generation with marginal-rate calibration ---
 
-    converted = rng.binomial(1, prob_convert)
+    control_mask = group == "control"
+    treatment_mask = group == "treatment"
+
+    control_target = config.true_control_rate
+    treatment_target = config.true_control_rate + config.true_lift
+
+    if not 0 < control_target < 1:
+        raise ValueError("true_control_rate must be between 0 and 1.")
+
+    if not 0 < treatment_target < 1:
+        raise ValueError(
+            "true_control_rate + true_lift must be between 0 and 1."
+        )
+
+    # Standardize the pre-experiment covariate.
+    standardized_activity = (pre_activity - 50) / 15
+
+    beta = config.covariate_correlation
+
+    # Calibrate control probabilities to the configured baseline.
+    control_intercept = _calibrate_intercept(
+        standardized_activity[control_mask],
+        control_target,
+        beta,
+    )
+
+    # Calibrate treatment probabilities to baseline + absolute lift.
+    treatment_intercept = _calibrate_intercept(
+        standardized_activity[treatment_mask],
+        treatment_target,
+        beta,
+    )
+
+    probabilities = np.empty(n)
+
+    probabilities[control_mask] = 1 / (
+        1 + np.exp(
+            -(
+                control_intercept
+                + beta * standardized_activity[control_mask]
+            )
+        )
+    )
+
+    probabilities[treatment_mask] = 1 / (
+        1 + np.exp(
+            -(
+                treatment_intercept
+                + beta * standardized_activity[treatment_mask]
+            )
+        )
+    )
+
+    converted = rng.binomial(1, probabilities)
 
     # --- Spread assignment across days (needed for sequential testing) ---
     day_assigned = rng.integers(0, config.n_days, size=n)
